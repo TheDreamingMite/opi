@@ -27,12 +27,13 @@
 
 static void pabort(const char *s)
 {
-	if (errno != 0)
-		perror(s);
-	else
-		printf("%s\n", s);
-
-	abort();
+    if (errno != 0) {
+        fprintf(stderr, "[PABORT] %s: %s\n", s, strerror(errno));
+    } else {
+        fprintf(stderr, "[PABORT] %s\n", s);
+    }
+    fflush(stderr);
+    exit(1);  // Вместо abort()
 }
 
 static const char *device = "/dev/spidev1.0";
@@ -129,12 +130,29 @@ static void transfer(int fd, uint8_t const *tx, uint8_t const *rx, size_t len)
         .bits_per_word = bits,
     };
 
+    // Отладочный вывод перед вызовом ioctl
+    fprintf(stderr, "[DEBUG] Preparing to send SPI message...\n");
+    fprintf(stderr, "[DEBUG] tr.tx_buf = 0x%lx, tr.rx_buf = 0x%lx, tr.len = %zu\n",
+            tr.tx_buf, tr.rx_buf, tr.len);
+    fprintf(stderr, "[DEBUG] tr.speed_hz = %u, tr.bits_per_word = %u\n",
+            tr.speed_hz, tr.bits_per_word);
+
     ret = ioctl(fd, SPI_IOC_MESSAGE(1), &tr);
+
+    fprintf(stderr, "[DEBUG] ioctl(SPI_IOC_MESSAGE) returned: %d\n", ret);
+
     if (ret < 1) {
-        fprintf(stderr, "ERROR: ioctl(SPI_IOC_MESSAGE) returned %d, errno=%d (%s)\n",
-                ret, errno, strerror(errno));
-        exit(1);  // вместо abort(), чтобы увидеть ошибку
+        fprintf(stderr, "[ERROR] ioctl(SPI_IOC_MESSAGE) failed: returned %d\n", ret);
+        if (errno != 0) {
+            fprintf(stderr, "[ERROR] errno = %d (%s)\n", errno, strerror(errno));
+        } else {
+            fprintf(stderr, "[ERROR] errno = 0, но вызов всё равно не удался.\n");
+        }
+        fflush(stderr);
+        exit(1);  // Вместо abort(), чтобы увидеть ошибку
     }
+
+    fprintf(stderr, "[DEBUG] ioctl(SPI_IOC_MESSAGE) succeeded.\n");
 
     if (verbose)
         hex_dump(tx, len, 32, "TX");
@@ -142,12 +160,12 @@ static void transfer(int fd, uint8_t const *tx, uint8_t const *rx, size_t len)
     if (output_file) {
         int out_fd = open(output_file, O_WRONLY | O_CREAT | O_TRUNC, 0666);
         if (out_fd < 0) {
-            perror("could not open output file");
+            perror("[ERROR] could not open output file");
             exit(1);
         }
         ret = write(out_fd, rx, len);
         if (ret != len) {
-            perror("not all bytes written to output file");
+            perror("[ERROR] not all bytes written to output file");
             close(out_fd);
             exit(1);
         }
