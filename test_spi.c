@@ -4,6 +4,9 @@
 #include <unistd.h>
 #include <sys/ioctl.h>
 #include <linux/spi/spidev.h>
+#include <stdint.h>
+#include <errno.h>
+#include <string.h> 
 
 int main() {
     int fd = open("/dev/spidev1.0", O_RDWR);
