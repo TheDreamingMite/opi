@@ -59,6 +59,17 @@ int main() {
     }
     fprintf(stdout, "[INFO] ✓ /dev/spidev1.0 opened successfully\n");
 
+    // *** NEW STEP: Set SPI Mode ***
+    fprintf(stdout, "[INFO] 1a. Setting SPI mode to MODE 0 (CPOL=0, CPHA=0)...\n");
+    uint8_t mode = SPI_MODE_0;
+    if (ioctl(fd_spi, SPI_IOC_WR_MODE, &mode) < 0) {
+        fprintf(stderr, "[ERROR] Can't set SPI mode to 0\n");
+        perror("ioctl SPI_IOC_WR_MODE");
+        close(fd_spi);
+        return 1;
+    }
+    fprintf(stdout, "[INFO] ✓ SPI mode set to 0\n");
+
     // Step 2: Configure GPIOs (PL8 = 360 for RESET)
     const int RESET_GPIO = 360;
     fprintf(stdout, "[INFO] 2. Configuring GPIO %d (RESET)...\n", RESET_GPIO);
@@ -77,6 +88,12 @@ int main() {
     gpio_write(RESET_GPIO, 1);  // HIGH = release reset
     fprintf(stdout, "[INFO] ✓ RESET sequence completed\n");
 
+    // *** NEW STEP: Add delay after RESET ***
+    fprintf(stdout, "[INFO] 3a. Waiting 500ms for SX1302 initialization after reset...\n");
+    usleep(500000); // Ждём 500 мс
+    fprintf(stdout, "[INFO] ✓ Initialization delay completed\n");
+
+
     // Step 4: Try to read Chip ID (register 0x00)
     fprintf(stdout, "[INFO] 4. Reading Chip ID (register 0x00) via SPI...\n");
     uint8_t tx[] = {0x00};
@@ -87,6 +104,7 @@ int main() {
         .len = 1,
         .speed_hz = 500000,
         .bits_per_word = 8,
+        // .delay_usecs = 1, // Опциональная небольшая задержка между CS и началом передачи
     };
 
     int ret = ioctl(fd_spi, SPI_IOC_MESSAGE(1), &tr);
@@ -104,15 +122,17 @@ int main() {
     if (rx[0] == 0x00) {
         fprintf(stderr, "[ERROR] Chip ID is 0x00 → SX1302 NOT RESPONDING!\n");
         fprintf(stdout, "[INFO] Possible causes:\n");
-        fprintf(stdout, "  - MISO not connected (most common)\n");
-        fprintf(stdout, "  - RESET not properly asserted\n");
+        fprintf(stdout, "  - MISO still not connected correctly (most common)\n"); // Обновил текст
+        fprintf(stdout, "  - RESET sequence might still be problematic\n");
         fprintf(stdout, "  - CS (HOST_CSN) on wrong pin (should be PH3/Pin 33)\n");
         fprintf(stdout, "  - Power supply unstable (< 4.8V on VCC)\n");
+        fprintf(stdout, "  - SPI mode might not be supported by device (though unlikely for default)\n"); // Добавил
     } else if (rx[0] == 0x01 || rx[0] == 0x02 || rx[0] == 0x03) {
         fprintf(stdout, "[INFO] ✓ Chip ID = 0x%02X → SX1302 is responding!\n", rx[0]);
         fprintf(stdout, "[INFO] → HAL should now work if config is correct.\n");
     } else {
         fprintf(stdout, "[INFO] Chip ID = 0x%02X → Unknown chip or partial response.\n", rx[0]);
+        fprintf(stdout, "[INFO] Could indicate successful communication but unexpected state (e.g., waiting for firmware).\n"); // Добавил пояснение
     }
 
     close(fd_spi);
