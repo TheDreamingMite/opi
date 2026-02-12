@@ -1,538 +1,373 @@
-// SPDX-License-Identifier: GPL-2.0-only
-/*
- * SPI testing utility (using spidev driver)
- *
- * Copyright (c) 2007  MontaVista Software, Inc.
- * Copyright (c) 2007  Anton Vorontsov <avorontsov@ru.mvista.com>
- *
- * Cross-compile with cross-gcc -I/path/to/cross-kernel/include
- */
-
-#include <stdint.h>
-#include <unistd.h>
 #include <stdio.h>
 #include <stdlib.h>
-#include <string.h>
+#include <stdint.h>
+#include <stdbool.h>
 #include <errno.h>
-#include <getopt.h>
 #include <fcntl.h>
+#include <unistd.h>
+#include <string.h>
 #include <time.h>
 #include <sys/ioctl.h>
-#include <linux/ioctl.h>
 #include <sys/stat.h>
-#include <linux/types.h>
 #include <linux/spi/spidev.h>
+#include <linux/types.h>
 
-#define ARRAY_SIZE(a) (sizeof(a) / sizeof((a)[0]))
+// --- Configuration ---
+#define SPI_DEVICE "/dev/spidev1.0"
+#define RESET_GPIO 360 // PL8
+#define RESET_GPIO_PATH "/sys/class/gpio/gpio360/value"
+#define RESET_GPIO_DIR_PATH "/sys/class/gpio/gpio360/direction"
+#define RESET_GPIO_EXPORT_PATH "/sys/class/gpio/export"
 
-static void pabort(const char *s)
-{
-    if (errno != 0) {
-        fprintf(stderr, "[PABORT] %s: %s\n", s, strerror(errno));
-    } else {
-        fprintf(stderr, "[PABORT] %s\n", s);
+// --- Register definitions (from loragw_reg.h/.c) ---
+#define SX1302_REG_COMMON_BASE_ADDR 0x5600
+#define SX1302_REG_COMMON_VERSION_VERSION 16 // Index in the array
+// Actual address: SX1302_REG_COMMON_BASE_ADDR + 6 = 0x5606
+#define SX1302_VERSION_REG_ADDR 0x5606
+
+// --- GPIO Helper Functions ---
+int gpio_export(int gpio_num) {
+    char buf[10];
+    int fd = open("/sys/class/gpio/export", O_WRONLY);
+    if (fd < 0) {
+        fprintf(stderr, "[ERROR] Cannot open GPIO export file: %s\n", strerror(errno));
+        return -1;
     }
-    fflush(stderr);
-    exit(1);  // Вместо abort()
+    snprintf(buf, sizeof(buf), "%d", gpio_num);
+    if (write(fd, buf, strlen(buf)) < 0) {
+        fprintf(stderr, "[ERROR] Cannot export GPIO %d: %s\n", gpio_num, strerror(errno));
+        close(fd);
+        return -1;
+    }
+    close(fd);
+    return 0;
 }
 
-static const char *device = "/dev/spidev1.0";
-static uint32_t mode;
-static uint8_t bits = 8;
-static char *input_file;
-static char *output_file;
-static uint32_t speed = 500000;
-static uint16_t delay;
-static uint16_t word_delay;
-static int verbose;
-static int transfer_size;
-static int iterations;
-static int interval = 5; /* interval in seconds for showing transfer rate */
+int gpio_set_direction(int gpio_num, const char *direction) {
+    char path[64];
+    int fd;
 
-static uint8_t default_tx[] = {
-	0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF,
-	0x40, 0x00, 0x00, 0x00, 0x00, 0x95,
-	0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF,
-	0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF,
-	0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF,
-	0xF0, 0x0D,
-};
-
-static uint8_t default_rx[ARRAY_SIZE(default_tx)] = {0, };
-static char *input_tx;
-
-static void hex_dump(const void *src, size_t length, size_t line_size,
-		     char *prefix)
-{
-	int i = 0;
-	const unsigned char *address = src;
-	const unsigned char *line = address;
-	unsigned char c;
-
-	printf("%s | ", prefix);
-	while (length-- > 0) {
-		printf("%02X ", *address++);
-		if (!(++i % line_size) || (length == 0 && i % line_size)) {
-			if (length == 0) {
-				while (i++ % line_size)
-					printf("__ ");
-			}
-			printf(" |");
-			while (line < address) {
-				c = *line++;
-				printf("%c", (c < 32 || c > 126) ? '.' : c);
-			}
-			printf("|\n");
-			if (length > 0)
-				printf("%s | ", prefix);
-		}
-	}
+    snprintf(path, sizeof(path), "/sys/class/gpio/gpio%d/direction", gpio_num);
+    fd = open(path, O_WRONLY);
+    if (fd < 0) {
+        fprintf(stderr, "[ERROR] Cannot open GPIO direction file for %d: %s\n", gpio_num, strerror(errno));
+        return -1;
+    }
+    if (write(fd, direction, strlen(direction)) < 0) {
+        fprintf(stderr, "[ERROR] Cannot set GPIO %d direction to %s: %s\n", gpio_num, direction, strerror(errno));
+        close(fd);
+        return -1;
+    }
+    close(fd);
+    return 0;
 }
 
-/*
- *  Unescape - process hexadecimal escape character
- *      converts shell input "\x23" -> 0x23
- */
-static int unescape(char *_dst, char *_src, size_t len)
-{
-	int ret = 0;
-	int match;
-	char *src = _src;
-	char *dst = _dst;
-	unsigned int ch;
+int gpio_write_value(int gpio_num, int value) {
+    char path[64];
+    int fd;
 
-	while (*src) {
-		if (*src == '\\' && *(src+1) == 'x') {
-			match = sscanf(src + 2, "%2x", &ch);
-			if (!match)
-				pabort("malformed input string");
-
-			src += 4;
-			*dst++ = (unsigned char)ch;
-		} else {
-			*dst++ = *src++;
-		}
-		ret++;
-	}
-	return ret;
+    snprintf(path, sizeof(path), "/sys/class/gpio/gpio%d/value", gpio_num);
+    fd = open(path, O_WRONLY);
+    if (fd < 0) {
+        fprintf(stderr, "[ERROR] Cannot open GPIO value file for %d: %s\n", gpio_num, strerror(errno));
+        return -1;
+    }
+    if (dprintf(fd, "%d", value) < 0) {
+        fprintf(stderr, "[ERROR] Cannot write value %d to GPIO %d: %s\n", value, gpio_num, strerror(errno));
+        close(fd);
+        return -1;
+    }
+    close(fd);
+    return 0;
 }
 
-static void transfer(int fd, uint8_t const *tx, uint8_t const *rx, size_t len)
-{
-    int ret;
+// --- Utility Functions ---
+void print_timestamp() {
+    struct timespec ts;
+    clock_gettime(CLOCK_REALTIME, &ts);
+    printf("[%ld.%06ld] ", ts.tv_sec, ts.tv_nsec / 1000);
+}
+
+// --- SPI Helper Functions ---
+// Function to read a single register using the correct SPI protocol
+int spi_read_register(int fd_spi, uint16_t addr, uint8_t *value) {
+    uint8_t tx[2];
+    uint8_t rx[2];
+
+    // Prepare the command: (addr & 0x7F) | 0x80 for read
+    tx[0] = (addr & 0x7F) | 0x80;
+    tx[1] = 0x00; // Dummy byte
+
     struct spi_ioc_transfer tr = {
         .tx_buf = (unsigned long)tx,
         .rx_buf = (unsigned long)rx,
-        .len = len,
-        .delay_usecs = delay,
-        .word_delay_usecs = word_delay,
-        .speed_hz = speed,
-        .bits_per_word = bits,
+        .len = 2, // 2 bytes for read command
+        .speed_hz = 500000, // Use same speed as before
+        .bits_per_word = 8,
+        .delay_usecs = 0,
+        .cs_change = 0,
     };
 
-    // Отладочный вывод перед вызовом ioctl
-    fprintf(stderr, "[DEBUG] Preparing to send SPI message...\n");
-    fprintf(stderr, "[DEBUG] tr.tx_buf = 0x%lx, tr.rx_buf = 0x%lx, tr.len = %zu\n",
-            tr.tx_buf, tr.rx_buf, tr.len);
-    fprintf(stderr, "[DEBUG] tr.speed_hz = %u, tr.bits_per_word = %u\n",
-            tr.speed_hz, tr.bits_per_word);
+    int ret = ioctl(fd_spi, SPI_IOC_MESSAGE(1), &tr);
+    if (ret < 0) {
+        fprintf(stderr, "[ERROR] ioctl(SPI_IOC_MESSAGE) for READ failed: %s\n", strerror(errno));
+        return -1;
+    }
 
-    ret = ioctl(fd, SPI_IOC_MESSAGE(1), &tr);
+    // Data is returned in rx[1]
+    *value = rx[1];
+    return 0;
+}
 
-    fprintf(stderr, "[DEBUG] ioctl(SPI_IOC_MESSAGE) returned: %d\n", ret);
+// Function to write a single register using the correct SPI protocol
+int spi_write_register(int fd_spi, uint16_t addr, uint8_t value) {
+    uint8_t tx[3];
+    uint8_t rx[3]; // Even for write, we need to read back something
 
-    if (ret < 1) {
-        fprintf(stderr, "[ERROR] ioctl(SPI_IOC_MESSAGE) failed: returned %d\n", ret);
-        if (errno != 0) {
-            fprintf(stderr, "[ERROR] errno = %d (%s)\n", errno, strerror(errno));
+    // Prepare the command: (addr & 0x7F) for write, followed by data
+    tx[0] = (addr & 0x7F);
+    tx[1] = value;
+    tx[2] = 0x00; // Dummy byte
+
+    struct spi_ioc_transfer tr = {
+        .tx_buf = (unsigned long)tx,
+        .rx_buf = (unsigned long)rx,
+        .len = 3, // 3 bytes for write command
+        .speed_hz = 500000,
+        .bits_per_word = 8,
+        .delay_usecs = 0,
+        .cs_change = 0,
+    };
+
+    int ret = ioctl(fd_spi, SPI_IOC_MESSAGE(1), &tr);
+    if (ret < 0) {
+        fprintf(stderr, "[ERROR] ioctl(SPI_IOC_MESSAGE) for WRITE failed: %s\n", strerror(errno));
+        return -1;
+    }
+    // Optionally check rx[1] if the protocol expects an echo or status
+    // For basic writes, we often don't care about the response here.
+    return 0;
+}
+
+
+// --- Main Diagnostic Function ---
+int main() {
+    print_timestamp();
+    fprintf(stdout, "[INFO] === Enhanced SPI Diagnostic Tool for Orange Pi 3 LTS + LoRaWAN1302 v2.1 (Corrected) ===\n");
+
+    // Check if SPI device exists
+    print_timestamp();
+    fprintf(stdout, "[INFO] 1. Checking if SPI device %s exists...\n", SPI_DEVICE);
+    struct stat st;
+    if (stat(SPI_DEVICE, &st) < 0) {
+        fprintf(stderr, "[ERROR] SPI device %s does not exist: %s\n", SPI_DEVICE, strerror(errno));
+        return 1;
+    }
+    print_timestamp();
+    fprintf(stdout, "[INFO] ✓ SPI device %s exists\n", SPI_DEVICE);
+
+    // Open SPI device
+    print_timestamp();
+    fprintf(stdout, "[INFO] 2. Opening SPI device %s...\n", SPI_DEVICE);
+    int fd_spi = open(SPI_DEVICE, O_RDWR);
+    if (fd_spi < 0) {
+        fprintf(stderr, "[ERROR] Cannot open %s: %s\n", SPI_DEVICE, strerror(errno));
+        return 1;
+    }
+    print_timestamp();
+    fprintf(stdout, "[INFO] ✓ SPI device %s opened successfully (fd=%d)\n", SPI_DEVICE, fd_spi);
+
+    // Configure SPI Mode 0
+    print_timestamp();
+    fprintf(stdout, "[INFO] 3. Configuring SPI mode...\n");
+    uint8_t mode = SPI_MODE_0; // CPOL=0, CPHA=0
+    if (ioctl(fd_spi, SPI_IOC_WR_MODE, &mode) < 0) {
+        fprintf(stderr, "[ERROR] Cannot set SPI mode %d: %s\n", mode, strerror(errno));
+        close(fd_spi);
+        return 1;
+    }
+    print_timestamp();
+    fprintf(stdout, "[INFO] ✓ SPI mode set to MODE 0 (CPOL=0, CPHA=0)\n");
+
+    // Configure SPI Speed
+    uint32_t speed = 500000; // 500 kHz
+    if (ioctl(fd_spi, SPI_IOC_WR_MAX_SPEED_HZ, &speed) < 0) {
+        fprintf(stderr, "[ERROR] Cannot set SPI speed %u Hz: %s\n", speed, strerror(errno));
+        close(fd_spi);
+        return 1;
+    }
+    print_timestamp();
+    fprintf(stdout, "[INFO] ✓ SPI max speed set to %u Hz\n", speed);
+
+    // Configure SPI Bits per Word
+    uint8_t bits = 8;
+    if (ioctl(fd_spi, SPI_IOC_WR_BITS_PER_WORD, &bits) < 0) {
+        fprintf(stderr, "[ERROR] Cannot set SPI bits per word %d: %s\n", bits, strerror(errno));
+        close(fd_spi);
+        return 1;
+    }
+    print_timestamp();
+    fprintf(stdout, "[INFO] ✓ SPI bits per word set to %d\n", bits);
+
+    // Configure RESET GPIO
+    print_timestamp();
+    fprintf(stdout, "[INFO] 4. Configuring GPIO %d (RESET)...\n", RESET_GPIO);
+    // Export GPIO first
+    if (access(RESET_GPIO_PATH, F_OK) == -1) {
+        if (gpio_export(RESET_GPIO) != 0) {
+            fprintf(stderr, "[ERROR] Failed to export GPIO %d\n", RESET_GPIO);
+            close(fd_spi);
+            return 1;
+        }
+        print_timestamp();
+        fprintf(stdout, "[INFO] ✓ GPIO %d exported\n", RESET_GPIO);
+    } else {
+         print_timestamp();
+         fprintf(stdout, "[INFO] ✓ GPIO %d already exported\n", RESET_GPIO);
+    }
+
+    // Set GPIO direction to output
+    if (gpio_set_direction(RESET_GPIO, "out") != 0) {
+        fprintf(stderr, "[ERROR] Failed to set GPIO %d direction to out\n", RESET_GPIO);
+        close(fd_spi);
+        return 1;
+    }
+    print_timestamp();
+    fprintf(stdout, "[INFO] ✓ GPIO %d direction set to out\n", RESET_GPIO);
+
+    // Read initial RESET state (optional, for info)
+    int fd_reset_val = open(RESET_GPIO_PATH, O_RDONLY);
+    if (fd_reset_val >= 0) {
+        char val_char;
+        if (read(fd_reset_val, &val_char, 1) > 0) {
+            print_timestamp();
+            fprintf(stdout, "[INFO] Initial RESET pin value: %c\n", val_char);
+        }
+        close(fd_reset_val);
+    }
+
+    // Perform RESET sequence: HIGH -> LOW -> HIGH
+    print_timestamp();
+    fprintf(stdout, "[INFO] 5. Performing RESET sequence (HIGH -> LOW -> HIGH)...\n");
+
+    // Ensure reset pin starts HIGH (inactive)
+    if (gpio_write_value(RESET_GPIO, 1) != 0) {
+        fprintf(stderr, "[ERROR] Failed to set GPIO %d HIGH before reset\n", RESET_GPIO);
+        close(fd_spi);
+        return 1;
+    }
+    print_timestamp();
+    fprintf(stdout, "[INFO] ✓ RESET pin set HIGH (inactive)\n");
+    usleep(100000); // 100 ms delay
+
+    // Set reset pin LOW (active reset)
+    if (gpio_write_value(RESET_GPIO, 0) != 0) {
+        fprintf(stderr, "[ERROR] Failed to set GPIO %d LOW for reset\n", RESET_GPIO);
+        close(fd_spi);
+        return 1;
+    }
+    print_timestamp();
+    fprintf(stdout, "[INFO] ✓ RESET pin set LOW (active reset)\n");
+    usleep(100000); // 100 ms delay
+
+    // Set reset pin HIGH (release reset)
+    if (gpio_write_value(RESET_GPIO, 1) != 0) {
+        fprintf(stderr, "[ERROR] Failed to set GPIO %d HIGH after reset\n", RESET_GPIO);
+        close(fd_spi);
+        return 1;
+    }
+    print_timestamp();
+    fprintf(stdout, "[INFO] ✓ RESET pin set HIGH (released reset)\n");
+
+    // Wait for SX1302 internal initialization after reset
+    print_timestamp();
+    fprintf(stdout, "[INFO] 5a. Waiting 500ms for SX1302 internal initialization after reset...\n");
+    usleep(500000); // 500 ms delay
+    print_timestamp();
+    fprintf(stdout, "[INFO] ✓ Initialization delay completed\n");
+
+    // Read initial RESET state again (optional, for info)
+    fd_reset_val = open(RESET_GPIO_PATH, O_RDONLY);
+    if (fd_reset_val >= 0) {
+        char val_char;
+        if (read(fd_reset_val, &val_char, 1) > 0) {
+            print_timestamp();
+            fprintf(stdout, "[INFO] RESET pin value after delay: %c\n", val_char);
+        }
+        close(fd_reset_val);
+    }
+
+
+    // Attempt to read Chip Version Register multiple times
+    const int num_attempts = 3;
+    bool chip_responded = false;
+    uint8_t chip_version = 0x00;
+
+    for (int attempt = 1; attempt <= num_attempts; attempt++) {
+        print_timestamp();
+        fprintf(stdout, "[INFO] 6. Attempt %d: Reading Chip Version Register (0x%04X) via SPI...\n", attempt, SX1302_VERSION_REG_ADDR);
+
+        if (spi_read_register(fd_spi, SX1302_VERSION_REG_ADDR, &chip_version) != 0) {
+             fprintf(stderr, "[ERROR] Failed to read register 0x%04X on attempt %d\n", SX1302_VERSION_REG_ADDR, attempt);
+             continue; // Try next attempt
+        }
+
+        print_timestamp();
+        fprintf(stdout, "[INFO] ✓ SPI transfer succeeded on attempt %d\n", attempt);
+        print_timestamp();
+        fprintf(stdout, "[INFO] Chip Version Register (0x%04X) read on attempt %d = 0x%02X\n", SX1302_VERSION_REG_ADDR, attempt, chip_version);
+
+        if (chip_version != 0x00 && chip_version != 0xFF) {
+            chip_responded = true;
+            break; // Found a potentially valid response
+        }
+    }
+
+    // Interpret final result
+    print_timestamp();
+    fprintf(stdout, "[RESULT] Final Chip Version Register Value = 0x%02X\n", chip_version);
+
+    if (chip_responded) {
+        if (chip_version == 0x01) { // Expected value for SX1302 rev1
+            print_timestamp();
+            fprintf(stdout, "[SUCCESS] ✓ Chip Version 0x%02X matches expected SX1302 rev1 ID!\n", chip_version);
+            print_timestamp();
+            fprintf(stdout, "[INFO] → HAL connection sequence (lgw_connect) should succeed if AGC/ARB firmware loads correctly.\n");
         } else {
-            fprintf(stderr, "[ERROR] errno = 0, но вызов всё равно не удался.\n");
+             print_timestamp();
+             fprintf(stdout, "[WARNING] Chip Version 0x%02X is non-zero but unexpected.\n", chip_version);
+             print_timestamp();
+             fprintf(stdout, "[INFO] → This might indicate a different chip revision or an issue.\n");
+             print_timestamp();
+             fprintf(stdout, "[INFO] → SX1302 might need firmware loading (AGC/ARB) before full functionality, but version check failed.\n");
         }
-        fflush(stderr);
-        exit(1);  // Вместо abort(), чтобы увидеть ошибку
+    } else {
+        // Both 0x00 and 0xFF are considered "not responding" for the main logic
+        print_timestamp();
+        fprintf(stderr, "[FAILURE] Chip Version Register indicates SX1302 is NOT RESPONDING CORRECTLY!\n");
+        print_timestamp();
+        fprintf(stdout, "[INFO] Possible causes (matching lgw_connect failure):\n");
+        print_timestamp();
+        fprintf(stdout, "  - MISO wire not connected/broken (most common cause of 0x00)\n");
+        print_timestamp();
+        fprintf(stdout, "  - CS wire not connected to correct pin (PH3/Pin 33) (common cause of 0x00)\n");
+        print_timestamp();
+        fprintf(stdout, "  - RESET wire not connected or sequence failed (can cause 0x00)\n");
+        print_timestamp();
+        fprintf(stdout, "  - Power supply unstable or insufficient (VCC must be 4.8V-5.5V under load)\n");
+        print_timestamp();
+        fprintf(stdout, "  - SPI mode/speed incorrect (unlikely if default mode used)\n");
+        print_timestamp();
+        fprintf(stdout, "  - MISO wire floating (can cause 0xFF if CS disconnected, but CS was active here)\n");
+        print_timestamp();
+        fprintf(stdout, "  - Defective LoRaWAN1302 module\n");
+        print_timestamp();
+        fprintf(stdout, "  - Internal chip failure after reset\n");
     }
 
-    fprintf(stderr, "[DEBUG] ioctl(SPI_IOC_MESSAGE) succeeded.\n");
+    close(fd_spi);
+    print_timestamp();
+    fprintf(stdout, "[INFO] Diagnostic tool finished.\n");
 
-    if (verbose)
-        hex_dump(tx, len, 32, "TX");
-
-    if (output_file) {
-        int out_fd = open(output_file, O_WRONLY | O_CREAT | O_TRUNC, 0666);
-        if (out_fd < 0) {
-            perror("[ERROR] could not open output file");
-            exit(1);
-        }
-        ret = write(out_fd, rx, len);
-        if (ret != len) {
-            perror("[ERROR] not all bytes written to output file");
-            close(out_fd);
-            exit(1);
-        }
-        close(out_fd);
-    }
-
-    if (verbose)
-        hex_dump(rx, len, 32, "RX");
-}
-
-static void print_usage(const char *prog)
-{
-	printf("Usage: %s [-2348CDFHILMNORSZbdilopsvw]\n", prog);
-	puts("general device settings:\n"
-		 "  -D --device         device to use (default /dev/spidev1.1)\n"
-		 "  -s --speed          max speed (Hz)\n"
-		 "  -d --delay          delay (usec)\n"
-		 "  -w --word-delay     word delay (usec)\n"
-		 "  -l --loop           loopback\n"
-		 "spi mode:\n"
-		 "  -H --cpha           clock phase\n"
-		 "  -O --cpol           clock polarity\n"
-		 "  -F --rx-cpha-flip   flip CPHA on Rx only xfer\n"
-		 "number of wires for transmission:\n"
-		 "  -2 --dual           dual transfer\n"
-		 "  -4 --quad           quad transfer\n"
-		 "  -8 --octal          octal transfer\n"
-		 "  -3 --3wire          SI/SO signals shared\n"
-		 "  -Z --3wire-hiz      high impedance turnaround\n"
-		 "data:\n"
-		 "  -i --input          input data from a file (e.g. \"test.bin\")\n"
-		 "  -o --output         output data to a file (e.g. \"results.bin\")\n"
-		 "  -p                  Send data (e.g. \"1234\\xde\\xad\")\n"
-		 "  -S --size           transfer size\n"
-		 "  -I --iter           iterations\n"
-		 "additional parameters:\n"
-		 "  -b --bpw            bits per word\n"
-		 "  -L --lsb            least significant bit first\n"
-		 "  -C --cs-high        chip select active high\n"
-		 "  -N --no-cs          no chip select\n"
-		 "  -R --ready          slave pulls low to pause\n"
-		 "  -M --mosi-idle-low  leave mosi line low when idle\n"
-		 "misc:\n"
-		 "  -v --verbose        Verbose (show tx buffer)\n");
-	exit(1);
-}
-
-static void parse_opts(int argc, char *argv[])
-{
-	while (1) {
-		static const struct option lopts[] = {
-			{ "device",        1, 0, 'D' },
-			{ "speed",         1, 0, 's' },
-			{ "delay",         1, 0, 'd' },
-			{ "word-delay",    1, 0, 'w' },
-			{ "loop",          0, 0, 'l' },
-			{ "cpha",          0, 0, 'H' },
-			{ "cpol",          0, 0, 'O' },
-			{ "rx-cpha-flip",  0, 0, 'F' },
-			{ "dual",          0, 0, '2' },
-			{ "quad",          0, 0, '4' },
-			{ "octal",         0, 0, '8' },
-			{ "3wire",         0, 0, '3' },
-			{ "3wire-hiz",     0, 0, 'Z' },
-			{ "input",         1, 0, 'i' },
-			{ "output",        1, 0, 'o' },
-			{ "size",          1, 0, 'S' },
-			{ "iter",          1, 0, 'I' },
-			{ "bpw",           1, 0, 'b' },
-			{ "lsb",           0, 0, 'L' },
-			{ "cs-high",       0, 0, 'C' },
-			{ "no-cs",         0, 0, 'N' },
-			{ "ready",         0, 0, 'R' },
-			{ "mosi-idle-low", 0, 0, 'M' },
-			{ "verbose",       0, 0, 'v' },
-			{ NULL, 0, 0, 0 },
-		};
-		int c;
-
-		c = getopt_long(argc, argv, "D:s:d:w:b:i:o:lHOLC3ZFMNR248p:vS:I:",
-				lopts, NULL);
-
-		if (c == -1)
-			break;
-
-		switch (c) {
-		case 'D':
-			device = optarg;
-			break;
-		case 's':
-			speed = atoi(optarg);
-			break;
-		case 'd':
-			delay = atoi(optarg);
-			break;
-		case 'w':
-			word_delay = atoi(optarg);
-			break;
-		case 'b':
-			bits = atoi(optarg);
-			break;
-		case 'i':
-			input_file = optarg;
-			break;
-		case 'o':
-			output_file = optarg;
-			break;
-		case 'l':
-			mode |= SPI_LOOP;
-			break;
-		case 'H':
-			mode |= SPI_CPHA;
-			break;
-		case 'O':
-			mode |= SPI_CPOL;
-			break;
-		case 'L':
-			mode |= SPI_LSB_FIRST;
-			break;
-		case 'C':
-			mode |= SPI_CS_HIGH;
-			break;
-		case '3':
-			mode |= SPI_3WIRE;
-			break;
-		case 'Z':
-			mode |= SPI_3WIRE_HIZ;
-			break;
-		case 'F':
-			mode |= SPI_RX_CPHA_FLIP;
-			break;
-		case 'M':
-			mode |= SPI_MOSI_IDLE_LOW;
-			break;
-		case 'N':
-			mode |= SPI_NO_CS;
-			break;
-		case 'v':
-			verbose = 1;
-			break;
-		case 'R':
-			mode |= SPI_READY;
-			break;
-		case 'p':
-			input_tx = optarg;
-			break;
-		case '2':
-			mode |= SPI_TX_DUAL;
-			break;
-		case '4':
-			mode |= SPI_TX_QUAD;
-			break;
-		case '8':
-			mode |= SPI_TX_OCTAL;
-			break;
-		case 'S':
-			transfer_size = atoi(optarg);
-			break;
-		case 'I':
-			iterations = atoi(optarg);
-			break;
-		default:
-			print_usage(argv[0]);
-		}
-	}
-	if (mode & SPI_LOOP) {
-		if (mode & SPI_TX_DUAL)
-			mode |= SPI_RX_DUAL;
-		if (mode & SPI_TX_QUAD)
-			mode |= SPI_RX_QUAD;
-		if (mode & SPI_TX_OCTAL)
-			mode |= SPI_RX_OCTAL;
-	}
-}
-
-static void transfer_escaped_string(int fd, char *str)
-{
-	size_t size = strlen(str);
-	uint8_t *tx;
-	uint8_t *rx;
-
-	tx = malloc(size);
-	if (!tx)
-		pabort("can't allocate tx buffer");
-
-	rx = malloc(size);
-	if (!rx)
-		pabort("can't allocate rx buffer");
-
-	size = unescape((char *)tx, str, size);
-	transfer(fd, tx, rx, size);
-	free(rx);
-	free(tx);
-}
-
-static void transfer_file(int fd, char *filename)
-{
-	ssize_t bytes;
-	struct stat sb;
-	int tx_fd;
-	uint8_t *tx;
-	uint8_t *rx;
-
-	if (stat(filename, &sb) == -1)
-		pabort("can't stat input file");
-
-	tx_fd = open(filename, O_RDONLY);
-	if (tx_fd < 0)
-		pabort("can't open input file");
-
-	tx = malloc(sb.st_size);
-	if (!tx)
-		pabort("can't allocate tx buffer");
-
-	rx = malloc(sb.st_size);
-	if (!rx)
-		pabort("can't allocate rx buffer");
-
-	bytes = read(tx_fd, tx, sb.st_size);
-	if (bytes != sb.st_size)
-		pabort("failed to read input file");
-
-	transfer(fd, tx, rx, sb.st_size);
-	free(rx);
-	free(tx);
-	close(tx_fd);
-}
-
-static uint64_t _read_count;
-static uint64_t _write_count;
-
-static void show_transfer_rate(void)
-{
-	static uint64_t prev_read_count, prev_write_count;
-	double rx_rate, tx_rate;
-
-	rx_rate = ((_read_count - prev_read_count) * 8) / (interval*1000.0);
-	tx_rate = ((_write_count - prev_write_count) * 8) / (interval*1000.0);
-
-	printf("rate: tx %.1fkbps, rx %.1fkbps\n", rx_rate, tx_rate);
-
-	prev_read_count = _read_count;
-	prev_write_count = _write_count;
-}
-
-static void transfer_buf(int fd, int len)
-{
-	uint8_t *tx;
-	uint8_t *rx;
-	int i;
-
-	tx = malloc(len);
-	if (!tx)
-		pabort("can't allocate tx buffer");
-	for (i = 0; i < len; i++)
-		tx[i] = random();
-
-	rx = malloc(len);
-	if (!rx)
-		pabort("can't allocate rx buffer");
-
-	transfer(fd, tx, rx, len);
-
-	_write_count += len;
-	_read_count += len;
-
-	if (mode & SPI_LOOP) {
-		if (memcmp(tx, rx, len)) {
-			fprintf(stderr, "transfer error !\n");
-			hex_dump(tx, len, 32, "TX");
-			hex_dump(rx, len, 32, "RX");
-			exit(1);
-		}
-	}
-
-	free(rx);
-	free(tx);
-}
-
-int main(int argc, char *argv[])
-{
-	int ret = 0;
-	int fd;
-	uint32_t request;
-
-	parse_opts(argc, argv);
-
-	if (input_tx && input_file)
-		pabort("only one of -p and --input may be selected");
-
-	fd = open(device, O_RDWR);
-	if (fd < 0)
-		pabort("can't open device");
-
-	/*
-	 * spi mode
-	 */
-	/* WR is make a request to assign 'mode' */
-	request = mode;
-	ret = ioctl(fd, SPI_IOC_WR_MODE32, &mode);
-	if (ret == -1)
-		pabort("can't set spi mode");
-
-	/* RD is read what mode the device actually is in */
-	ret = ioctl(fd, SPI_IOC_RD_MODE32, &mode);
-	if (ret == -1)
-		pabort("can't get spi mode");
-	/* Drivers can reject some mode bits without returning an error.
-	 * Read the current value to identify what mode it is in, and if it
-	 * differs from the requested mode, warn the user.
-	 */
-	if (request != mode)
-		printf("WARNING device does not support requested mode 0x%x\n",
-			request);
-
-	/*
-	 * bits per word
-	 */
-	ret = ioctl(fd, SPI_IOC_WR_BITS_PER_WORD, &bits);
-	if (ret == -1)
-		pabort("can't set bits per word");
-
-	ret = ioctl(fd, SPI_IOC_RD_BITS_PER_WORD, &bits);
-	if (ret == -1)
-		pabort("can't get bits per word");
-
-	/*
-	 * max speed hz
-	 */
-	ret = ioctl(fd, SPI_IOC_WR_MAX_SPEED_HZ, &speed);
-	if (ret == -1)
-		pabort("can't set max speed hz");
-
-	ret = ioctl(fd, SPI_IOC_RD_MAX_SPEED_HZ, &speed);
-	if (ret == -1)
-		pabort("can't get max speed hz");
-
-	printf("spi mode: 0x%x\n", mode);
-	printf("bits per word: %u\n", bits);
-	printf("max speed: %u Hz (%u kHz)\n", speed, speed/1000);
-
-	if (input_tx)
-		transfer_escaped_string(fd, input_tx);
-	else if (input_file)
-		transfer_file(fd, input_file);
-	else if (transfer_size) {
-		struct timespec last_stat;
-
-		clock_gettime(CLOCK_MONOTONIC, &last_stat);
-
-		while (iterations-- > 0) {
-			struct timespec current;
-
-			transfer_buf(fd, transfer_size);
-
-			clock_gettime(CLOCK_MONOTONIC, &current);
-			if (current.tv_sec - last_stat.tv_sec > interval) {
-				show_transfer_rate();
-				last_stat = current;
-			}
-		}
-		printf("total: tx %.1fKB, rx %.1fKB\n",
-		       _write_count/1024.0, _read_count/1024.0);
-	} else
-		transfer(fd, default_tx, default_rx, sizeof(default_tx));
-
-	close(fd);
-
-	return ret;
+    return (chip_responded && chip_version == 0x01) ? 0 : 1; // Return 0 only on full success
 }
