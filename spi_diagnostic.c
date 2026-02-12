@@ -23,7 +23,7 @@
 #define SX1302_REG_COMMON_BASE_ADDR 0x5600
 #define SX1302_REG_COMMON_VERSION_VERSION 16 // Index in the array
 // Actual address: SX1302_REG_COMMON_BASE_ADDR + 6 = 0x5606
-#define SX1302_VERSION_REG_ADDR 0x5606
+#define SX1302_VERSION_REG_ADDR 0x5600
 
 // --- GPIO Helper Functions ---
 int gpio_export(int gpio_num) {
